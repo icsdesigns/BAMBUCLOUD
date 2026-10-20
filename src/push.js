@@ -195,6 +195,9 @@ export class PushHub {
       // un objeto vacio significa "lo que haya", no "nada".
       prefs: s.prefs && typeof s.prefs === 'object' ? s.prefs : {},
       mutedUntil: Number(s.mutedUntil) || null,
+      // Rol: el id del testigo de admin enlazado a este aparato (ver
+      // src/roles.js), o null si es un usuario estandar.
+      adminKid: s.adminKid || null,
       label: s.label || describeDevice(s.ua, s),
     }));
   }
@@ -241,6 +244,7 @@ export class PushHub {
         at: s.at || null,
         lastSeen: s.lastSeen || s.at || null,
         standalone: Boolean(s.standalone),
+        admin: Boolean(s.adminKid),
         vendor: s.vendor || detectVendor(s.ua, s.model),
         // Lo que ha elegido su dueno desde la campana. Viaja al panel de
         // administracion para que no haya que adivinar por que un movil no
@@ -294,6 +298,9 @@ export class PushHub {
       // un silencio de 48 h a la primera visita.
       prefs: { ...(prev?.prefs || {}) },
       mutedUntil: prev?.mutedUntil || null,
+      // El rol es del aparato: renovar la suscripcion no puede quitarle el
+      // permiso de administrador ni dar uno que no tenia.
+      adminKid: info.adminKid || prev?.adminKid || null,
       // Las marcas de entrega son del aparato, no de la suscripcion: renovarla
       // no puede borrar que lleva tres semanas sin confirmar un aviso.
       lastSendAt: prev?.lastSendAt || null,
@@ -386,6 +393,42 @@ export class PushHub {
     return { ok: true, id, mutedUntil: target.mutedUntil };
   }
 
+  /** Enlaza (o desenlaza, con `null`) un dispositivo con un testigo de admin. */
+  setAdmin(id, kid) {
+    const list = this.subscriptions;
+    const target = list.find((s) => s.id === id);
+    if (!target) return { ok: false, error: 'Dispositivo no encontrado' };
+    target.adminKid = kid || null;
+    this.subscriptions = list;
+    console.log(`[push] ${target.label} ${kid ? 'es ahora administrador' : 'ya no es administrador'}`);
+    return { ok: true, id, admin: Boolean(kid) };
+  }
+
+  /**
+   * Deja como usuarios estandar a los dispositivos cuyo testigo ya no existe
+   * (revocado, o ADMIN_CODE cambiado). Devuelve cuantos cambio.
+   *
+   * @param {Set<string>|string[]} validKids
+   */
+  reconcileAdmins(validKids) {
+    const valid = new Set(validKids);
+    const list = this.subscriptions;
+    let changed = 0;
+    for (const s of list) {
+      if (s.adminKid && !valid.has(s.adminKid)) {
+        s.adminKid = null;
+        changed += 1;
+      }
+    }
+    if (changed) this.subscriptions = list;
+    return changed;
+  }
+
+  /** Los que son administradores y recibirian un aviso ahora mismo. */
+  get adminCount() {
+    return this.subscriptions.filter((s) => s.adminKid).length;
+  }
+
   /** Saca un dispositivo del registro. Volvera si su dueno abre la app. */
   remove(id) {
     const list = this.subscriptions;
@@ -413,8 +456,13 @@ export class PushHub {
    * @param {boolean} [opts.ignoreEnabled] enviar aunque este silenciado
    * @param {string|null} [opts.type] tipo de aviso, para las preferencias
    * @param {string|null} [opts.category] su categoria ('basic' | 'other')
+   * @param {'all'|'admin'|'standard'} [opts.audience] a quien va dirigido: todos,
+   *   solo los dispositivos de administrador, o solo los de usuarios estandar
    */
-  async send(payload, { only = null, ignoreEnabled = false, type = null, category = null } = {}) {
+  async send(
+    payload,
+    { only = null, ignoreEnabled = false, type = null, category = null, audience = 'all' } = {},
+  ) {
     if (!this.enabled) return { sent: 0, removed: 0, skipped: 0 };
     const all = this.subscriptions;
     const now = Date.now();
@@ -424,6 +472,8 @@ export class PushHub {
       // lo que se esta preguntando es si el canal funciona, y que siga callado
       // ya lo dice la lista.
       if (only) return true;
+      if (audience === 'admin' && !s.adminKid) return false;
+      if (audience === 'standard' && s.adminKid) return false;
       if (s.enabled === false && !ignoreEnabled) return false;
       if (isMuted(s, now)) return false;
       if (category === 'other' && type && s.prefs?.[type] === false) return false;
