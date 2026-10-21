@@ -216,6 +216,7 @@ export class Notifier extends EventEmitter {
    * @param {number} [opts.progressStep] notificar cada N% (0 = desactivado)
    * @param {import('./store.js').Store} [opts.store]
    * @param {import('./push.js').PushHub} [opts.push]
+   * @param {import('./help.js').HelpWindow} [opts.help] decide a quien llega cada aviso
    */
   constructor(opts = {}) {
     super();
@@ -226,6 +227,7 @@ export class Notifier extends EventEmitter {
     this.progressStep = Number(opts.progressStep ?? 0);
     this.store = opts.store || null;
     this.push = opts.push || null;
+    this.help = opts.help || null;
 
     this.prev = null;
     this.seenHms = new Set();
@@ -446,7 +448,12 @@ export class Notifier extends EventEmitter {
     // en el historial el evento hace saltar un aviso en pantalla. Sin esto, un
     // tipo apagado desde el panel seguia avisando en las pestanas abiertas,
     // que es justo lo que el interruptor dice que no debe pasar.
-    const event = { type, text, at: Date.now(), notify: allowed, ...meta };
+    // A quien va dirigido, calculado UNA vez aqui y no en cada canal: el
+    // navegador tambien lo necesita, porque una pestana abierta de un usuario
+    // estandar recibe todos los eventos por WebSocket y, sin esto, los
+    // mostraria como aviso aunque el push no se los haya mandado.
+    const audience = meta.audience || this.help?.audienceFor(type) || 'all';
+    const event = { type, text, at: Date.now(), notify: allowed, ...meta, audience };
 
     this.history.unshift(event);
     this.history = this._prune(this.history);
@@ -455,7 +462,7 @@ export class Notifier extends EventEmitter {
     this.emit('notification', event);
 
     if (!allowed) return event;
-    this.send(text, { ...meta, type }).catch((err) => this.emit('error', err));
+    this.send(text, { ...meta, type, audience }).catch((err) => this.emit('error', err));
     return event;
   }
 
@@ -471,6 +478,21 @@ export class Notifier extends EventEmitter {
    */
   announce(text, meta = {}) {
     return this.fire('announce', text, { level: 'warning', ...meta }, { force: true });
+  }
+
+  /**
+   * «Necesitaré tu ayuda…»: el admin ha dicho que si. Va a los usuarios
+   * estandar —el admin ya sabe lo que ha pulsado— y deja rastro en el
+   * historial como cualquier otro aviso. Salta los interruptores del panel
+   * (lo ha pedido una persona), pero no el silencio de cada dispositivo.
+   */
+  callForHelp(text, meta = {}) {
+    return this.fire(
+      'help',
+      text,
+      { level: 'info', printerName: 'Bambustatus', audience: 'standard', ...meta },
+      { force: true },
+    );
   }
 
   _prune(list) {
@@ -546,8 +568,14 @@ export class Notifier extends EventEmitter {
             url: '/',
           },
           // El tipo y su categoria viajan hasta el reparto porque ahi vive el
-          // segundo filtro: el de lo que cada movil ha elegido recibir.
-          { type: meta.type || null, category: CATEGORY_OF.get(meta.type) || null },
+          // segundo filtro: el de lo que cada movil ha elegido recibir. Y la
+          // audiencia, el primero de todos: con los roles en marcha, un usuario
+          // estandar solo recibe lo que el admin le ha abierto (src/help.js).
+          {
+            type: meta.type || null,
+            category: CATEGORY_OF.get(meta.type) || null,
+            audience: meta.audience || 'all',
+          },
         ),
       );
     }

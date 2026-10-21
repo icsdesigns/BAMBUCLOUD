@@ -13,7 +13,7 @@
  * dato viejo es peor que ningun dato.
  */
 
-const CACHE = 'bambustatus-shell-v10';
+const CACHE = 'bambustatus-shell-v11';
 // Sin '/index.html': el servidor lo entrega en '/', y pedir los dos en el
 // mismo addAll hace que el navegador aborte la instalacion entera con
 // "Entry already exists". Un Service Worker que no instala no solo deja de
@@ -117,9 +117,14 @@ self.addEventListener('push', (event) => {
     // pinta la silueta que marque el canal alfa. Ademas acaba en unos 24 px, y
     // ahi el alambre no sobrevive: va la silueta maciza de la figura.
     badge: '/badge-96.png',
-    data: { url: data.url || '/' },
+    data: { url: data.url || '/', askId: data.askId || null },
     vibrate: [90, 60, 90],
   };
+  // La pregunta de «¿pides ayuda?» lleva botones. El navegador recorta los que
+  // no caben (Android deja dos, iOS ninguno): tocar el cuerpo del aviso abre
+  // la app con la misma pregunta, asi que ningun botón es imprescindible.
+  if (Array.isArray(data.actions) && data.actions.length) options.actions = data.actions;
+  if (data.requireInteraction) options.requireInteraction = true;
   // Acuse de recibo. El servidor solo sabe que el push service ACEPTO el
   // mensaje, no que se haya visto: sin esto, un movil cuyo fabricante mata los
   // avisos en segundo plano (los Xiaomi / Redmi son el caso de manual) se ve
@@ -140,9 +145,56 @@ self.addEventListener('push', (event) => {
   event.waitUntil(self.registration.showNotification(title, options).then(() => ack));
 });
 
+/**
+ * Contesta a la pregunta de ayuda desde el propio aviso, sin abrir la app.
+ *
+ * Va con la cookie de administrador del navegador (httpOnly, la lleva sola):
+ * si este movil no es admin, o la cookie ya no vale, el servidor dice 403 y se
+ * cae a abrir la app, donde se puede contestar igualmente.
+ *
+ * @returns {Promise<boolean>} si la respuesta quedo registrada
+ */
+async function answerHelp(askId, choice) {
+  try {
+    const res = await fetch('/api/admin/help', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ choice, askId }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+const HELP_REPLY = {
+  yes: 'Ayuda activada para esta impresión.',
+  yes12: 'Ayuda activada durante 12 horas.',
+  no: 'De acuerdo, no se pide ayuda.',
+};
+
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
   const target = event.notification.data?.url || '/';
+  const askId = event.notification.data?.askId;
+
+  if (askId && HELP_REPLY[event.action]) {
+    event.waitUntil(
+      answerHelp(askId, event.action).then((ok) => {
+        if (ok) {
+          return self.registration.showNotification('Bambustatus', {
+            body: HELP_REPLY[event.action],
+            tag: 'help-ask-done',
+            icon: '/notify-icon.png',
+            badge: '/badge-96.png',
+          });
+        }
+        return self.clients.openWindow(target);
+      }),
+    );
+    return;
+  }
 
   event.waitUntil(
     self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((list) => {

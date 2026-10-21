@@ -820,3 +820,24 @@ Los PNG están versionados: si tocas la geometría o los colores, regenera y sú
 ## Licencia
 
 MIT
+
+
+## Administradores y usuarios estándar
+
+- **Administrador** es un *dispositivo* con un testigo en una cookie `httpOnly`
+  (`bambu.adm`). El servidor solo guarda su HMAC (clave derivada con scrypt de
+  `ADMIN_CODE`); cambiar `ADMIN_CODE` revoca a todos. Máximo `ADMIN_MAX` (3).
+- El primer admin se da de alta desde **Administración** con el código; los
+  siguientes necesitan además una *invitación* de un solo uso (5 min) que genera
+  un admin ya existente.
+- Mientras no haya admins todo funciona como siempre. Con admins, los usuarios
+  estándar **no reciben avisos de la impresora** salvo que el admin abra la ayuda.
+- Al empezar cada impresión, el admin recibe un aviso con **Sí / Sí 12h / No**
+  (Android recorta a 2 botones y iOS no muestra botones: tocar el aviso abre la
+  app con la misma pregunta; sin contestar equivale a «No»).
+  - **Sí**: ayuda hasta retirar la pieza de esa impresión.
+  - **Sí 12h**: ayuda durante 12 horas (no se vuelve a preguntar en ese plazo).
+  - Ambos mandan a los usuarios: «¡Necesitaré tu ayuda con las siguientes
+    impresiones! …». Con la ayuda activa, los usuarios reciben «ya puedes
+    retirar la impresión».
+- Tests: `npm test`.

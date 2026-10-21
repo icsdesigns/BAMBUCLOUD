@@ -1350,12 +1350,48 @@ button.primary:active{transform:scale(.98)}
       </p>
       <input id="admin-code" type="password" inputmode="numeric" maxlength="12"
              placeholder="••••" autocomplete="off">
+      <!-- Con administradores ya dados de alta, el codigo solo no basta: hace
+           falta la invitacion de un solo uso que genera uno de ellos. -->
+      <input id="admin-invite" class="hidden" type="text" inputmode="numeric" maxlength="8"
+             placeholder="Invitación de un administrador" autocomplete="off"
+             style="margin-top:9px">
       <p id="admin-msg" class="msg"></p>
       <button id="admin-unlock" class="primary">Desbloquear</button>
     </div>
 
     <!-- Desbloqueado -->
     <div id="admin-panel" class="hidden">
+
+      <!-- Roles: quien es administrador. El rol es del DISPOSITIVO y se guarda
+           cifrado en el servidor (ver src/roles.js). -->
+      <div class="section">
+        <h3>Administradores</h3>
+        <p class="note" id="role-note" style="margin:0 0 11px"></p>
+        <div class="btn-row">
+          <button class="btn" id="btn-enroll">Hacer administrador este dispositivo</button>
+          <button class="btn hidden" id="btn-invite">Invitar a otro administrador</button>
+        </div>
+        <p class="note" id="invite-note"></p>
+        <div id="admin-list"></div>
+      </div>
+
+      <!-- Ayuda con las impresiones: abre los avisos de «pieza lista» a los
+           usuarios estandar. Normalmente se decide desde la pregunta que llega
+           al empezar cada trabajo; esto es el mando manual. -->
+      <div class="section">
+        <h3>Ayuda con las impresiones</h3>
+        <p class="note" id="help-state" style="margin:0 0 11px"></p>
+        <div class="btn-row">
+          <button class="btn" data-help="yes">Esta impresión</button>
+          <button class="btn" data-help="yes12">Durante 12 h</button>
+          <button class="btn" data-help="no">Desactivar</button>
+        </div>
+        <p class="note">
+          Sin ayuda activa, los usuarios estándar no reciben ningún aviso de la impresora.
+          Con ella, reciben el de «ya se puede retirar la pieza» y un aviso inmediato
+          pidiéndoles que estén atentos. Los administradores lo reciben todo siempre.
+        </p>
+      </div>
 
       <div class="section">
         <h3>Notificaciones</h3>
@@ -1373,9 +1409,10 @@ button.primary:active{transform:scale(.98)}
         <div id="trigger-list"></div>
 
         <p class="note">
-          Esto es lo que reciben <b>todos los dispositivos</b> de forma predeterminada. Las
-          básicas llegan siempre; de «otras notificaciones», cada móvil puede quedarse con
-          las que quiera desde su campana.
+          Esto es lo que reciben <b>los administradores</b> (y todos los dispositivos mientras
+          no haya ninguno). Las básicas llegan siempre; de «otras notificaciones», cada móvil
+          puede quedarse con las que quiera desde su campana. Los usuarios estándar solo
+          reciben avisos cuando hay ayuda activa.
         </p>
 
         <p class="note" id="push-note"></p>
@@ -1422,6 +1459,30 @@ button.primary:active{transform:scale(.98)}
         <button class="btn" id="btn-dash-logout">Salir del dashboard</button>
       </div>
     </div>
+  </div>
+</div>
+
+<!-- ====================== Pregunta: ¿pides ayuda? ========================
+     Solo la ve un administrador, cuando empieza una impresion. Es la misma
+     pregunta que lleva la notificacion push con sus tres botones. -->
+<div id="help-ask" class="modal hidden" role="dialog" aria-labelledby="help-ask-title">
+  <div class="sheet">
+    <div class="sheet-head">
+      <h2 id="help-ask-title">¿Pides ayuda a los usuarios?</h2>
+      <button class="close" id="help-ask-close" aria-label="Cerrar">
+        <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <p id="help-ask-text" style="color:var(--dim);font-size:13.5px;margin:0 0 14px;line-height:1.5"></p>
+    <div class="btn-row" style="flex-direction:column">
+      <button class="btn primary" data-ask="yes">Sí, para esta impresión</button>
+      <button class="btn" data-ask="yes12">Sí, durante 12 horas</button>
+      <button class="btn" data-ask="no">No</button>
+    </div>
+    <p class="note" style="font-size:12px;color:var(--faint);margin:11px 0 0;line-height:1.5">
+      Si dices que sí, los usuarios reciben un aviso ahora y otro cuando la pieza esté
+      lista para retirar. Si no contestas, es un «No».
+    </p>
   </div>
 </div>
 
@@ -2392,6 +2453,11 @@ function connectWs() {
       if (payload.printer) renderPrinter(payload.printer);
       lastCycle = payload.cycle || null;
       settings = payload.settings || null;
+      if (payload.help) helpState = payload.help;
+      adminInfo.rolesActive = Boolean(payload.roles?.active);
+      // Quien soy lo dice el servidor; se pregunta en cada conexion porque la
+      // pregunta de ayuda pudo llegar mientras la app estaba cerrada.
+      refreshAdminStatus().then(handleHelpParam);
       // Si el numero es mas pequeno que el que teniamos, el servidor se ha
       // reiniciado: el cronometro vuelve a cero solo y eso es exactamente lo
       // que se quiere ver.
@@ -2443,6 +2509,14 @@ function connectWs() {
       // pintarla seria trabajo para nadie.
       if (adminPanelOpen()) renderDevices(payload.devices || []);
     }
+    else if (type === 'help') {
+      helpState = payload;
+      paintRoles();
+      // Contestada desde otro dispositivo: la pregunta de este sobra.
+      if (shownAsk && !payload.active) hideHelpAsk();
+    }
+    else if (type === 'help-ask') { if (adminInfo.isAdmin) showHelpAsk(payload); }
+    else if (type === 'roles') refreshAdminStatus();
     else if (type === 'bambu-logout') { lastState = null; lastDataAt = null; paintSync(); }
     else if (type === 'camera') { lastCameraAt = payload.at; refreshCamera(); }
     else if (type === 'notification') { pushFeed(payload); notifyBrowser(payload); }
@@ -3447,6 +3521,12 @@ function notifyBrowser(e) {
   // El servidor decide que tipos avisan; aqui solo se obedece. Los eventos
   // antiguos del historial no traen la marca, pero tampoco pasan por aqui.
   if (e.notify === false) return;
+  // Con roles en marcha, los avisos se dirigen: una pestana de un usuario
+  // estandar recibe todos los eventos por WebSocket, pero solo debe mostrar los
+  // suyos (y un administrador no necesita el «necesitare tu ayuda» que acaba de
+  // disparar el).
+  if (e.audience === 'admin' && !adminInfo.isAdmin) return;
+  if (e.audience === 'standard' && adminInfo.isAdmin) return;
   // Y lo que haya elegido este dispositivo manda por encima: si no, el movil
   // silenciado seguiria avisando en la pestana abierta, que es justo lo que el
   // silencio dice que no debe pasar.
@@ -3720,9 +3800,8 @@ $('onboard-notify').onclick = async () => {
 
 function openAdmin() {
   $('admin').classList.remove('hidden');
-  fetch('/api/admin/status')
-    .then((r) => r.json())
-    .then((r) => (r.unlocked ? showAdminPanel() : showAdminLock()))
+  refreshAdminStatus()
+    .then((r) => (r?.unlocked ? showAdminPanel() : showAdminLock()))
     .catch(showAdminLock);
 }
 
@@ -3731,12 +3810,17 @@ function showAdminLock() {
   $('admin-panel').classList.add('hidden');
   $('admin-msg').textContent = '';
   $('admin-code').value = '';
+  // Con administradores ya dados de alta, el codigo solo no abre nada: pide
+  // tambien la invitacion de uno de ellos.
+  $('admin-invite').value = '';
+  $('admin-invite').classList.toggle('hidden', !adminInfo.needsInvite);
   setTimeout(() => $('admin-code').focus(), 60);
 }
 
 async function showAdminPanel() {
   $('admin-lock').classList.add('hidden');
   $('admin-panel').classList.remove('hidden');
+  paintRoles();
   try {
     const r = await fetch('/api/settings').then((x) => x.json());
     settings = r.settings;
@@ -4024,13 +4108,197 @@ $('admin-unlock').onclick = async () => {
   const res = await fetch('/api/admin/unlock', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: $('admin-code').value }),
+    body: JSON.stringify({ code: $('admin-code').value, invite: $('admin-invite').value }),
   });
-  if (res.ok) { showAdminPanel(); return; }
+  if (res.ok) { await refreshAdminStatus(); showAdminPanel(); return; }
   const j = await res.json().catch(() => ({}));
-  failMsg($('admin-msg'), res.status === 429 ? j.error : 'Código incorrecto');
+  failMsg($('admin-msg'), res.status === 429 || res.status === 403 ? j.error : 'Código incorrecto');
 };
 $('admin-code').onkeydown = (e) => { if (e.key === 'Enter') $('admin-unlock').click(); };
+$('admin-invite').onkeydown = (e) => { if (e.key === 'Enter') $('admin-unlock').click(); };
+
+// ===========================================================================
+// Roles y ayuda con las impresiones
+//
+// Un administrador es ESTE dispositivo con un testigo en una cookie httpOnly
+// (src/roles.js); la pagina nunca lo ve, solo pregunta al servidor si lo es.
+// Al empezar una impresion el servidor le pregunta al admin si quiere ayuda
+// (Si / Si 12h / No); aqui se pinta esa pregunta, venga por push, por
+// WebSocket o abriendo la app desde el aviso.
+// ===========================================================================
+
+/** Lo que el servidor dice de quien soy y de los demas administradores. */
+let adminInfo = {
+  isAdmin: false, rolesActive: false, needsInvite: false, admins: [], me: null, max: 3,
+};
+/** Si hay ayuda abierta para los usuarios estandar. */
+let helpState = { active: false, mode: 'off', untilAt: null };
+/** La pregunta que se esta mostrando, para saber que se contesta. */
+let shownAsk = null;
+/** La que el usuario cerro con la X: no se vuelve a abrir sola al reconectar. */
+let dismissedAskId = null;
+
+async function refreshAdminStatus() {
+  const res = await fetch('/api/admin/status').catch(() => null);
+  if (!res?.ok) return null;
+  const j = await res.json().catch(() => null);
+  if (!j) return null;
+  adminInfo = { ...adminInfo, ...j };
+  if (j.help) helpState = j.help;
+  paintRoles();
+  if (j.isAdmin && j.ask && j.ask.id !== dismissedAskId) showHelpAsk(j.ask);
+  return j;
+}
+
+function helpText() {
+  if (!helpState.active) return 'Desactivada: los usuarios estándar no reciben avisos.';
+  if (helpState.mode === 'until') {
+    return `Activa hasta ${untilText(helpState.untilAt)}: los usuarios reciben el aviso de pieza lista.`;
+  }
+  return 'Activa para la impresión en curso: se cierra al retirar la pieza.';
+}
+
+function paintRoles() {
+  if (!$('role-note')) return;
+  const { isAdmin, rolesActive, admins = [], me, max } = adminInfo;
+  $('role-note').textContent = isAdmin
+    ? 'Este dispositivo es administrador. Recibe todos los avisos y la pregunta de ayuda '
+      + 'cada vez que empieza una impresión.'
+    : rolesActive
+      ? 'Este dispositivo es un usuario estándar. Solo un administrador puede responder a '
+        + 'las preguntas de ayuda.'
+      : 'Todavía no hay administradores, así que todos los dispositivos reciben los avisos '
+        + 'como siempre. Al hacer administrador este dispositivo, los demás pasan a ser '
+        + 'usuarios estándar y solo reciben avisos cuando pidas ayuda.';
+  $('btn-enroll').classList.toggle('hidden', isAdmin);
+  $('btn-invite').classList.toggle('hidden', !isAdmin);
+  $('admin-list').innerHTML = admins.map((a) => `<div class="dev${a.kid === me ? ' is-me' : ''}">
+      <div class="txt">
+        <b>${escapeHtml(a.label || 'Dispositivo')}</b>
+        <small>Alta ${escapeHtml(new Date(a.at).toLocaleDateString([], { day: 'numeric', month: 'short' }))}</small>
+      </div>
+      ${isAdmin ? `<button class="kill" data-revoke="${escapeAttr(a.kid)}"
+          title="Revocar administrador" aria-label="Revocar administrador">
+        <svg viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></svg></button>` : ''}
+    </div>`).join('');
+  $('admin-list').querySelectorAll('[data-revoke]').forEach((el) => {
+    el.onclick = () => revokeAdmin(el.dataset.revoke);
+  });
+  if (rolesActive) {
+    $('invite-note').textContent = `${admins.length} de ${max} administradores.`;
+  } else {
+    $('invite-note').textContent = '';
+  }
+  $('help-state').textContent = helpText();
+  document.querySelectorAll('[data-help]').forEach((b) => { b.disabled = !isAdmin; });
+}
+
+async function revokeAdmin(kid) {
+  const mine = kid === adminInfo.me;
+  if (!confirm(mine
+    ? 'Vas a quitarle el rol de administrador a ESTE dispositivo. ¿Seguro?'
+    : '¿Revocar este administrador? Pasará a ser un usuario estándar.')) return;
+  const res = await fetch(`/api/admin/admins/${encodeURIComponent(kid)}`, { method: 'DELETE' });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(j.error || 'No se pudo revocar', 'err'); return; }
+  toast('Administrador revocado', 'ok');
+  await refreshAdminStatus();
+  if (!adminInfo.isAdmin && adminInfo.rolesActive) $('admin').classList.add('hidden');
+  if (!adminInfo.isAdmin) showAdminLock();
+}
+
+$('btn-enroll').onclick = async () => {
+  const btn = $('btn-enroll');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/admin/enroll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId: myDeviceId, label: myDevice?.label || '' }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) { toast(j.error || 'No se pudo completar el alta', 'err'); return; }
+    toast('Este dispositivo es ahora administrador', 'ok');
+    await refreshAdminStatus();
+    // Si aun no tenia las notificaciones concedidas, la pregunta solo le llegara
+    // al abrir la app. Se dice, porque es lo que pasaria sin explicacion.
+    if (!myDeviceId) {
+      $('invite-note').textContent = 'Activa las notificaciones de este dispositivo (la campana) '
+        + 'para que te llegue la pregunta de ayuda con la app cerrada.';
+    }
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+$('btn-invite').onclick = async () => {
+  const res = await fetch('/api/admin/invite', { method: 'POST' });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(j.error || 'No se pudo generar', 'err'); return; }
+  const mins = Math.round((j.expiresAt - Date.now()) / 60_000);
+  $('invite-note').textContent = `Invitación: ${j.code} · válida ${mins} min y un solo uso. `
+    + 'En el otro dispositivo: abre Administración e introduce el código y esta invitación.';
+};
+
+/** Ayuda desde el panel, sin esperar a la pregunta de una impresion. */
+document.querySelectorAll('[data-help]').forEach((b) => {
+  b.onclick = () => sendHelpAnswer(b.dataset.help, null);
+});
+
+async function sendHelpAnswer(choice, askId) {
+  const res = await fetch('/api/admin/help', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ choice, askId }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(j.error || 'No se pudo guardar', 'err'); return false; }
+  if (j.help) helpState = j.help;
+  paintRoles();
+  toast({
+    yes: 'Ayuda activada para esta impresión',
+    yes12: 'Ayuda activada durante 12 horas',
+    no: 'Sin ayuda de los usuarios',
+  }[choice], 'ok');
+  return true;
+}
+
+function showHelpAsk(ask) {
+  if (!ask || shownAsk?.id === ask.id) return;
+  shownAsk = ask;
+  const job = ask.jobName ? ` «${ask.jobName}»` : '';
+  $('help-ask-text').textContent =
+    `Ha empezado la impresión${job}. ¿Quieres que los usuarios te ayuden a retirar las piezas?`;
+  $('help-ask').classList.remove('hidden');
+}
+
+function hideHelpAsk(dismissed = false) {
+  if (dismissed && shownAsk) dismissedAskId = shownAsk.id;
+  $('help-ask').classList.add('hidden');
+  shownAsk = null;
+}
+
+document.querySelectorAll('[data-ask]').forEach((b) => {
+  b.onclick = async () => {
+    if (!shownAsk) return;
+    const ok = await sendHelpAnswer(b.dataset.ask, shownAsk.id);
+    if (ok) hideHelpAsk();
+  };
+});
+$('help-ask-close').onclick = () => hideHelpAsk(true);
+
+/** Abrir la app desde el aviso trae `?help=<id>`: se limpia y se consulta. */
+function handleHelpParam() {
+  const url = new URL(location.href);
+  if (!url.searchParams.has('help')) return;
+  url.searchParams.delete('help');
+  history.replaceState(null, '', url.pathname + (url.search || '') + url.hash);
+  // Venir desde el aviso es pedir la pregunta, aunque se hubiera cerrado antes.
+  dismissedAskId = null;
+  refreshAdminStatus().then((r) => {
+    if (r?.isAdmin && !r.ask) toast('Esa pregunta ya estaba contestada o ha caducado');
+  });
+}
 
 $('sw-enabled').onclick = () => saveSettings({ enabled: !settings?.enabled });
 

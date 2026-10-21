@@ -29,6 +29,8 @@ import { KeepCookie, KEEP_MAX_AGE_MS } from './keep-cookie.js';
 import { LoginGuard, guarded } from './rate-limit.js';
 import { PushHub, MUTE_HOURS } from './push.js';
 import { JobCycle } from './job-cycle.js';
+import { AdminRegistry, ADMIN_COOKIE, ADMIN_COOKIE_MAX_AGE_MS } from './roles.js';
+import { HelpWindow, HELP_CALL_TEXT, connectHelp } from './help.js';
 import { FineProgress } from './progress.js';
 import { ERROR_DB_INFO } from './error-codes.js';
 import { parseWindow, insideWindow, estimateMonthlyHours } from './wake.js';
@@ -45,7 +47,13 @@ const STATE_FILE =
   process.env.STATE_FILE || path.join(path.dirname(TOKEN_FILE), 'bambu-state.json');
 const DASH_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
 const AGENT_TOKEN = process.env.AGENT_TOKEN || '';
+// Sin ADMIN_CODE se cae al codigo historico, que esta en el repositorio y por
+// tanto no protege nada: vale para no romper un despliegue existente, no para
+// dejarlo asi. Con roles, ese codigo es lo unico que separa a un usuario de
+// convertirse en el primer administrador.
+const ADMIN_CODE_FROM_ENV = Boolean(process.env.ADMIN_CODE);
 const ADMIN_CODE = String(process.env.ADMIN_CODE || '1510');
+const ADMIN_MAX = Number(process.env.ADMIN_MAX || 3);
 const COOL_MS = Number(process.env.COOLDOWN_MS || 15 * 60_000);
 // La misma zona sirve para dos relojes distintos: la franja de vigilia del
 // keep-alive y el "vuelvo a estar disponible" de las 9:00.
@@ -105,6 +113,16 @@ const push = new PushHub({
   store,
 });
 
+// Roles: quien es administrador y si el aviso de "ayuda con las impresiones"
+// esta abierto a los usuarios estandar. Ver src/roles.js y src/help.js.
+const admins = new AdminRegistry({ code: ADMIN_CODE, store, max: ADMIN_MAX });
+const help = new HelpWindow({ store, admins });
+if (admins.active && !ADMIN_CODE_FROM_ENV) {
+  console.warn(
+    '[roles] hay administradores pero ADMIN_CODE no esta definido: se usa el codigo ' +
+      'por defecto, que es publico. Define ADMIN_CODE en el entorno (cambiarlo revoca a todos los admins).',
+  );
+}
 const notifier = new Notifier({
   telegramToken: process.env.TELEGRAM_BOT_TOKEN,
   telegramChatId: process.env.TELEGRAM_CHAT_ID,
@@ -113,7 +131,12 @@ const notifier = new Notifier({
   progressStep: Number(process.env.NOTIFY_PROGRESS_STEP || 0),
   store,
   push,
+  help,
 });
+
+// Un dispositivo cuyo testigo ya no existe (revocado, o ADMIN_CODE cambiado)
+// deja de contar como admin al arrancar.
+push.reconcileAdmins(admins.list().map((a) => a.kid));
 
 const jobCycle = new JobCycle({ coolMs: COOL_MS, store });
 
@@ -203,6 +226,10 @@ function snapshot() {
     cycle: jobCycle.toJSON(),
     settings: notifier.settings,
     push: pushInfo(),
+    // Si los roles estan en marcha y si la ayuda esta abierta: es lo que
+    // cualquier usuario puede saber. Quien es admin lo dice /api/admin/status.
+    roles: { active: admins.active },
+    help: help.toJSON(),
     loginPending: app_state.loginPending,
     // Segundos desde que arranco ESTE proceso, no una marca de tiempo: asi el
     // navegador la traduce con su propio reloj y no hereda el desfase del
@@ -277,6 +304,17 @@ function wireCloud(cloud) {
 }
 
 notifier.on('notification', (event) => broadcast('notification', event));
+
+// Al empezar cada trabajo se le pregunta al admin si quiere ayuda; ver
+// src/help.js. Registrado antes que el manejador de abajo: lo primero que
+// tiene que pasar al cambiar de fase es cerrar la ayuda del trabajo anterior.
+connectHelp({
+  jobCycle,
+  help,
+  push,
+  broadcast,
+  title: () => app_state.printer?.name || 'Bambu Lab A1',
+});
 notifier.on('error', (err) => console.error('[notify]', err.message));
 
 // ---------------------------------------------------------------------------
@@ -756,6 +794,9 @@ app.post('/api/push/subscribe', requireAuth, (req, res) => {
     // distingue un movil de otro en la lista y lo que decide que pasos dar
     // cuando uno deja de recibir avisos.
     model: String(req.body?.info?.model || '').slice(0, 40),
+    // Si este navegador lleva el testigo de administrador, la suscripcion
+    // queda marcada como de admin: es lo que hace que le llegue la pregunta.
+    adminKid: adminRole(req)?.kid || null,
   });
   if (!result.ok) return res.status(400).json(result);
   broadcastDevices();
@@ -917,13 +958,18 @@ app.post('/api/device/:id/mute', requireAuth, (req, res) => {
 // ---------------------------------------------------------------------------
 // Administracion
 //
-// El codigo es una barrera de conveniencia sobre una sesion ya autenticada,
-// no un segundo factor: evita tocar por accidente los ajustes desde un movil
-// desbloqueado, nada mas.
+// Dos cosas distintas que antes eran una:
 //
-// Por eso el desbloqueo caduca solo aunque la sesion no lo haga: la sesion
-// dura hasta que se pulsa "Salir", y dejar el panel abierto para siempre
-// vaciaria de sentido la barrera.
+//   ser admin   un DISPOSITIVO con un testigo de administrador en su cookie
+//               (src/roles.js). Es el rol: persistente, revocable, y la unica
+//               puerta a las respuestas de «ayuda con las impresiones».
+//   desbloquear el panel con el codigo. Sigue existiendo, pero ahora es la
+//               puerta para HACERSE admin, no para serlo: caduca a la hora y
+//               solo funciona si aun no hay ningun admin o se trae la
+//               invitacion de uno.
+//
+// Cualquiera de las dos abre el panel (`requireAdmin`); solo la primera
+// contesta las preguntas de ayuda (`requireAdminRole`).
 // ---------------------------------------------------------------------------
 
 const ADMIN_TTL = 60 * 60_000;
@@ -932,20 +978,53 @@ function adminUnlocked(req) {
   return Number(req.session?.adminUntil) > Date.now();
 }
 
+/** El registro del admin que hace la peticion, o null si es un usuario. */
+function adminRole(req) {
+  return admins.fromRequest(req);
+}
+
 function requireAdmin(req, res, next) {
-  if (adminUnlocked(req)) return next();
+  if (adminRole(req) || adminUnlocked(req)) return next();
   return res.status(403).json({ error: 'Panel de administración bloqueado' });
 }
 
-function sameCode(given) {
-  const a = Buffer.from(String(given).padEnd(32).slice(0, 32));
-  const b = Buffer.from(ADMIN_CODE.padEnd(32).slice(0, 32));
-  return crypto.timingSafeEqual(a, b) && String(given).length === ADMIN_CODE.length;
+/** Solo un dispositivo con testigo de admin: ni el codigo basta. */
+function requireAdminRole(req, res, next) {
+  if (adminRole(req)) return next();
+  return res.status(403).json({ error: 'Solo un administrador puede hacer esto' });
 }
 
+function setAdminCookie(res, token) {
+  res.cookie(ADMIN_COOKIE, token, {
+    maxAge: ADMIN_COOKIE_MAX_AGE_MS,
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: COOKIE_SECURE,
+    path: '/',
+  });
+}
+
+function clearAdminCookie(res) {
+  res.clearCookie(ADMIN_COOKIE, { httpOnly: true, sameSite: 'lax', secure: COOKIE_SECURE, path: '/' });
+}
+
+/**
+ * Desbloquea el panel. Con roles en marcha pide, ademas del codigo, la
+ * invitacion de un admin: saber el codigo ya no basta para entrar.
+ */
 app.post('/api/admin/unlock', requireAuth, guarded(loginGuard, 'admin', (req, res) => {
-  if (!sameCode(req.body?.code || '')) {
+  if (!admins.checkCode(String(req.body?.code || ''))) {
     return res.status(401).json({ error: 'Código incorrecto' });
+  }
+  if (admins.active && !adminRole(req)) {
+    if (!admins.consumeInvite(String(req.body?.invite || ''))) {
+      // Mensaje deliberadamente igual para invitacion mala y para ausente:
+      // no hay que decirle a quien adivina el codigo que ha acertado.
+      return res.status(403).json({
+        error: 'Código incorrecto o invitación no válida',
+        needsInvite: true,
+      });
+    }
   }
   req.session.adminUntil = Date.now() + ADMIN_TTL;
   res.json({ ok: true });
@@ -957,7 +1036,98 @@ app.post('/api/admin/lock', requireAuth, (req, res) => {
 });
 
 app.get('/api/admin/status', requireAuth, (req, res) => {
-  res.json({ unlocked: adminUnlocked(req) });
+  const role = adminRole(req);
+  res.json({
+    unlocked: Boolean(role) || adminUnlocked(req),
+    // El rol, aparte del desbloqueo: es lo que decide si este movil recibe y
+    // contesta las preguntas de ayuda.
+    isAdmin: Boolean(role),
+    me: role?.kid || null,
+    rolesActive: admins.active,
+    // Hace falta invitacion para hacerse admin cuando ya hay alguno.
+    needsInvite: admins.active,
+    admins: role || adminUnlocked(req) ? admins.list() : undefined,
+    max: ADMIN_MAX,
+    help: help.toJSON(),
+    ask: role ? help.openAsk() : null,
+  });
+});
+
+/**
+ * Convierte ESTE dispositivo en administrador. Requiere el panel desbloqueado
+ * (y por tanto el codigo y, si ya hay admins, una invitacion). Devuelve el
+ * testigo por cookie httpOnly: el JavaScript de la pagina nunca lo ve.
+ */
+app.post('/api/admin/enroll', requireAuth, (req, res) => {
+  if (!adminUnlocked(req)) {
+    return res.status(403).json({ error: 'Desbloquea el panel con el código primero' });
+  }
+  const deviceId = req.body?.deviceId ? String(req.body.deviceId) : null;
+  const result = admins.enroll({
+    deviceId,
+    label: String(req.body?.label || '').trim() || 'Dispositivo',
+  });
+  if (!result.ok) return res.status(409).json(result);
+  // Un aparato solo tiene un rol: si ya era admin con otro testigo, el viejo
+  // se da de baja para no acumular huellas de un mismo movil.
+  const previous = adminRole(req);
+  if (previous) admins.revoke(previous.kid);
+  setAdminCookie(res, result.token);
+  if (deviceId) push.setAdmin(deviceId, result.kid);
+  // Es la unica alta de la que el panel no se entera por WebSocket de otra
+  // forma: se difunde para que las listas abiertas se actualicen.
+  broadcastDevices();
+  broadcast('roles', { active: admins.active });
+  console.log(`[roles] nuevo administrador (${admins.count}/${ADMIN_MAX}): ${result.kid}`);
+  res.json({ ok: true, kid: result.kid, admins: admins.list() });
+});
+
+/** Genera la invitacion de un solo uso para dar de alta a otro admin. */
+app.post('/api/admin/invite', requireAuth, requireAdminRole, (req, res) => {
+  res.json({ ok: true, ...admins.createInvite() });
+});
+
+/** Revoca un administrador (puede ser uno mismo) y le quita el rol a su movil. */
+app.delete('/api/admin/admins/:kid', requireAuth, requireAdminRole, (req, res) => {
+  const kid = String(req.params.kid);
+  const self = adminRole(req);
+  if (!admins.revoke(kid)) return res.status(404).json({ error: 'Administrador no encontrado' });
+  push.reconcileAdmins(admins.list().map((a) => a.kid));
+  if (self?.kid === kid) clearAdminCookie(res);
+  broadcastDevices();
+  broadcast('roles', { active: admins.active });
+  console.log(`[roles] administrador revocado: ${kid}`);
+  res.json({ ok: true, admins: admins.list() });
+});
+
+// ---------------------------------------------------------------------------
+// Ayuda con las impresiones
+//
+// El admin contesta a la pregunta que le llega cuando empieza una impresion
+// (o la activa a mano desde el panel). Ver src/help.js para el modelo.
+// ---------------------------------------------------------------------------
+
+/** Estado publico: cualquier usuario puede ver si la ayuda esta abierta. */
+app.get('/api/help', requireAuth, (req, res) => {
+  const role = adminRole(req);
+  res.json({ ...help.toJSON(), ask: role ? help.openAsk() : null, isAdmin: Boolean(role) });
+});
+
+app.post('/api/admin/help', requireAuth, requireAdminRole, (req, res) => {
+  const choice = String(req.body?.choice || '');
+  const askId = req.body?.askId ? String(req.body.askId) : null;
+  const result = help.answer(choice, askId);
+  if (!result.ok) return res.status(result.status).json({ error: result.error });
+
+  if (result.announce) {
+    // El aviso inmediato a todos los usuarios estandar. Sin esperar al push
+    // service: lo que la peticion necesita saber es que la decision esta
+    // tomada, no que Apple o Google hayan contestado.
+    notifier.callForHelp(HELP_CALL_TEXT);
+  }
+  broadcast('help', help.toJSON());
+  console.log(`[ayuda] ${choice}${askId ? ` (pregunta ${askId})` : ' (manual)'}`);
+  res.json({ ok: true, already: Boolean(result.already), help: result.state });
 });
 
 app.get('/api/settings', requireAuth, (req, res) => {
@@ -971,7 +1141,7 @@ app.get('/api/settings', requireAuth, (req, res) => {
     push: pushInfo(),
     // Solo con el panel desbloqueado: la lista dice que aparatos entran en la
     // cuenta y no es asunto de una sesion cualquiera.
-    devices: adminUnlocked(req) ? push.devices : null,
+    devices: adminRole(req) || adminUnlocked(req) ? push.devices : null,
     channels: {
       telegram: Boolean(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
       discord: Boolean(process.env.DISCORD_WEBHOOK),
