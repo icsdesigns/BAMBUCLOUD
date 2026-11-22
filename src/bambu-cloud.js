@@ -162,13 +162,18 @@ export class BambuCloud extends EventEmitter {
       return { ok: false, error: 'Faltan email o password' };
     }
 
-    const { json } = await this._post(PATHS.login, {
+    const { status, json, text } = await this._post(PATHS.login, {
       account: this.email,
       password: this.password,
       apiError: '',
     });
 
-    if (!json) return { ok: false, error: 'Respuesta de login invalida' };
+    if (!json) {
+      return {
+        ok: false,
+        error: `Respuesta de login invalida (HTTP ${status}): ${String(text || '').slice(0, 120)}`,
+      };
+    }
 
     const data = json.data || {};
     const token = json.accessToken || data.accessToken;
@@ -250,12 +255,22 @@ export class BambuCloud extends EventEmitter {
   /** Impresoras vinculadas a la cuenta. */
   async listDevices() {
     const { status, json } = await this._get(PATHS.bind);
-    if (status === 401 || status === 403) {
-      const err = new Error('El token de Bambu ya no vale');
+    const devices = json?.devices || json?.data?.devices;
+    // Bambu no siempre contesta 401 a un token caducado: a veces es un 200/400
+    // con un cuerpo de error y sin lista de equipos. Eso no es "cuenta sin
+    // impresoras", es un token rechazado, y hay que rehacer el login.
+    const rejected =
+      status === 401 ||
+      status === 403 ||
+      (!Array.isArray(devices) && (status === 400 || (json && (json.code || json.error || json.apiError))));
+    if (rejected) {
+      const err = new Error(`El token de Bambu ya no vale (HTTP ${status})`);
       err.unauthorized = true;
       throw err;
     }
-    const devices = json?.devices || json?.data?.devices || [];
+    if (!Array.isArray(devices)) {
+      throw new Error(`Respuesta inesperada al listar impresoras (HTTP ${status})`);
+    }
     this.devices = devices.map((d) => ({
       serial: d.dev_id,
       name: d.name,
