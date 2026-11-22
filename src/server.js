@@ -178,9 +178,36 @@ function loadCachedToken() {
   }
 }
 
+// Bambu ya no da un JWT legible: el token es opaco y no trae fecha de caducidad.
+// Lo unico que se puede hacer es contar desde que se obtuvo. Vive unos 90 dias
+// (BAMBU_TOKEN_LIFETIME_DAYS lo ajusta). Sin disco (Render gratis) la fecha se
+// pierde en cada reinicio: por eso BAMBU_TOKEN_ISSUED_AT (ISO, p. ej. 2026-11-23)
+// permite fijarla a mano junto al BAMBU_TOKEN.
+const TOKEN_LIFETIME_MS = Number(process.env.BAMBU_TOKEN_LIFETIME_DAYS || 90) * 86_400_000;
+const TOKEN_WARN_DAYS = [14, 7, 3, 1];
+
+function readTokenFile() {
+  try {
+    return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** Cuando se obtuvo el token en uso, o null si no se sabe. */
+function tokenIssuedAt(token) {
+  const f = readTokenFile();
+  if (f.token && f.token === token && Number.isFinite(f.issuedAt)) return f.issuedAt;
+  const env = Date.parse(process.env.BAMBU_TOKEN_ISSUED_AT || '');
+  if (Number.isFinite(env) && token && token === process.env.BAMBU_TOKEN) return env;
+  return null;
+}
+
 function saveToken({ token, expiresAt }) {
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token, expiresAt }), { mode: 0o600 });
+    const prev = readTokenFile();
+    const issuedAt = prev.token === token && Number.isFinite(prev.issuedAt) ? prev.issuedAt : Date.now();
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token, expiresAt, issuedAt }), { mode: 0o600 });
   } catch (err) {
     console.error('[token] no se pudo guardar:', err.message);
   }
@@ -197,6 +224,50 @@ function broadcast(type, payload) {
   for (const ws of wss.clients) {
     if (ws.readyState === 1) ws.send(msg);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Avisos al administrador sobre el token de Bambu
+// ---------------------------------------------------------------------------
+
+const adminTokenAlerts = new Map(); // tag -> ultimo envio
+const ADMIN_ALERT_GAP_MS = 6 * 3_600_000;
+
+/** Push solo a los dispositivos de administrador, sin repetirse en 6 h. */
+function alertAdmins(tag, body) {
+  const last = adminTokenAlerts.get(tag) || 0;
+  if (Date.now() - last < ADMIN_ALERT_GAP_MS) return;
+  adminTokenAlerts.set(tag, Date.now());
+  console.warn(`[token] aviso a administradores: ${body}`);
+  if (!push.enabled) return;
+  push
+    .send(
+      { title: 'Bambustatus', body, tag: `token-${tag}`, url: '/' },
+      { audience: 'admin' },
+    )
+    .catch((err) => console.error('[token] aviso fallido:', err.message));
+}
+
+/** Revisa cuantos dias le quedan al token y avisa en 14, 7, 3 y 1 dias. */
+function checkTokenExpiry() {
+  const token = app_state.cloud?.accessToken;
+  if (!token) return;
+  const issued = tokenIssuedAt(token);
+  if (!issued) return;
+  const daysLeft = Math.ceil((issued + TOKEN_LIFETIME_MS - Date.now()) / 86_400_000);
+  const step = TOKEN_WARN_DAYS.find((d) => daysLeft <= d);
+  if (step === undefined) return;
+  alertAdmins(
+    `expiry-${step}`,
+    daysLeft <= 0
+      ? '⚠️ El token de Bambu ha caducado o está a punto de hacerlo. Renuévalo desde el panel: Cerrar sesión y Reconectar.'
+      : `⚠️ El token de Bambu caduca en ~${daysLeft} día(s). Renuévalo desde el panel: Cerrar sesión y Reconectar.`,
+  );
+}
+
+/** La app se ha quedado sin sesion de Bambu y hace falta una persona. */
+function alertTokenNeeded(detail) {
+  alertAdmins('needed', `🔑 Bambustatus ha perdido la conexión con Bambu: ${detail}`);
 }
 
 /** Resumen del estado de Web Push que consumen el snapshot y varias rutas. */
@@ -274,6 +345,7 @@ function wireCloud(cloud) {
 
   cloud.on('auth-expired', async () => {
     console.warn('[cloud] token caducado, reintentando login');
+    ignoreEnvToken = true;
     cloud.disconnect();
     fs.rmSync(TOKEN_FILE, { force: true });
     cloud.mqttUsername = null;
@@ -300,6 +372,7 @@ function wireCloud(cloud) {
       app_state.status = { connected: false, detail: `Relogin fallido: ${res.error}` };
     }
     broadcast('status', app_state.status);
+    alertTokenNeeded(app_state.status.detail);
   });
 }
 
@@ -350,7 +423,7 @@ async function startCloud() {
     // El token en cache manda sobre BAMBU_TOKEN: la variable de entorno es
     // solo la semilla inicial. Al reves, un BAMBU_TOKEN caducado ganaria para
     // siempre al token nuevo obtenido desde el dashboard.
-    accessToken: loadCachedToken() || process.env.BAMBU_TOKEN || null,
+    accessToken: loadCachedToken() || (ignoreEnvToken ? null : process.env.BAMBU_TOKEN) || null,
     serial: process.env.PRINTER_SERIAL || null,
   });
   app_state.cloud = cloud;
@@ -366,6 +439,7 @@ async function startCloud() {
       if (!err.unauthorized) throw err;
       // El token cacheado ya no sirve: lo tiramos y hacemos login normal.
       console.warn('[cloud] token cacheado rechazado, rehaciendo login');
+      ignoreEnvToken = true;
       fs.rmSync(TOKEN_FILE, { force: true });
       cloud.accessToken = null;
       cloud.mqttUsername = null;
@@ -384,10 +458,13 @@ async function startCloud() {
             : 'Introduce tu codigo 2FA en el dashboard.',
       };
       broadcast('status', app_state.status);
+      alertTokenNeeded(app_state.status.detail);
       return;
     }
     app_state.status = { connected: false, detail: res.error };
     console.error('[cloud] login fallido:', res.error);
+    broadcast('status', app_state.status);
+    alertTokenNeeded(res.error);
     return;
   }
 
@@ -395,6 +472,11 @@ async function startCloud() {
 }
 
 let taskTimer = null;
+
+// Tras cerrar sesion, o tras un rechazo del token, BAMBU_TOKEN ya no vale como
+// semilla: sigue en el entorno, caducado, y reconectar volveria a usarlo en
+// bucle sin pedir nunca el codigo de email.
+let ignoreEnvToken = false;
 
 async function finishStartup(cloud) {
   app_state.loginPending = null;
@@ -1173,12 +1255,15 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
  */
 app.post('/api/admin/announce', requireAuth, requireAdmin, (req, res) => {
   const custom = String(req.body?.text || '').trim().slice(0, 160);
-  const event = notifier.announce(custom || '🔄 Abre la app: hay una actualización en camino', {
-    printerName: 'Bambustatus',
-    detail: custom
-      ? null
-      : 'Al aplicarse, la interfaz se reiniciará. Ábrela para no quedarte con una versión vieja.',
-  });
+  const event = notifier.announce(
+    custom || '🔄 Hay una actualización en camino: abre la app pasados 10 minutos desde este aviso',
+    {
+      printerName: 'Bambustatus',
+      detail: custom
+        ? null
+        : 'Al aplicarse, la interfaz se reiniciará. Espera 10 minutos desde que recibas este aviso y entonces abre la app, para no quedarte con una versión vieja.',
+    },
+  );
   // El reparto lo hace fire() por dentro y no se espera a que termine: lo
   // que el panel necesita saber no es si el push service ha contestado, sino
   // a cuantos aparatos iba dirigido y cuantos estaban callados.
@@ -1204,6 +1289,7 @@ app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
     app_state.cloud.mqttUsername = null;
   }
   fs.rmSync(TOKEN_FILE, { force: true });
+  ignoreEnvToken = true;
   clearInterval(taskTimer);
 
   app_state.normalized = null;
@@ -1223,7 +1309,12 @@ app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
 app.post('/api/admin/bambu-login', requireAuth, requireAdmin, async (req, res) => {
   try {
     await startCloud();
-    res.json({ ok: true, loginPending: app_state.loginPending });
+    res.json({
+      ok: true,
+      loginPending: app_state.loginPending,
+      connected: Boolean(app_state.status?.connected),
+      detail: app_state.status?.detail || '',
+    });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1353,6 +1444,9 @@ server.listen(PORT, () => {
     );
   }
   if (push.enabled) console.log(`[push] activo, ${push.count} dispositivo(s) suscrito(s)`);
+  // Aviso de caducidad del token al administrador: al arrancar y cada 6 horas.
+  setTimeout(checkTokenExpiry, 60_000).unref();
+  setInterval(checkTokenExpiry, 6 * 3_600_000).unref();
   console.log(
     `[errores] catálogo oficial v${ERROR_DB_INFO.version} (${ERROR_DB_INFO.lang}): ` +
       `${ERROR_DB_INFO.hmsCount} códigos HMS, ${ERROR_DB_INFO.printCount} de impresión` +

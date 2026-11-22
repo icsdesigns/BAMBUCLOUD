@@ -4383,8 +4383,8 @@ async function waitForAcks(sentAt, only, timeoutMs = 12_000) {
  */
 $('btn-announce').onclick = async () => {
   const btn = $('btn-announce');
-  if (!confirm('Se avisará a todos los dispositivos de que abran la app porque viene una '
-      + 'actualización. ¿Enviar?')) return;
+  if (!confirm('Se avisará a todos los dispositivos de que viene una actualización y de que '
+      + 'abran la app pasados 10 minutos desde que reciban el aviso. ¿Enviar?')) return;
   btn.disabled = true;
   try {
     const res = await fetch('/api/admin/announce', { method: 'POST' });
@@ -4413,7 +4413,9 @@ $('btn-bambu-login').onclick = async () => {
   const res = await fetch('/api/admin/bambu-login', { method: 'POST' });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) { toast(j.error || 'No se pudo reconectar', 'err'); return; }
-  toast(j.loginPending ? 'Bambu ha enviado un código de verificación' : 'Reconectando…', 'ok');
+  if (j.loginPending) toast('Bambu ha enviado un código de verificación', 'ok');
+  else if (j.connected) toast('Reconectado', 'ok');
+  else toast(j.detail || 'No se pudo reconectar', 'err');
   $('admin').classList.add('hidden');
 };
 
