@@ -178,9 +178,22 @@ function loadCachedToken() {
   }
 }
 
+// El token de Bambu es opaco (sin "exp"), asi que la caducidad se estima desde
+// el momento en que se obtuvo: se guarda junto al token. Si es el mismo token
+// que ya estaba en disco se conserva la fecha original.
+let tokenIssuedAt = null;
+
 function saveToken({ token, expiresAt }) {
   try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token, expiresAt }), { mode: 0o600 });
+    let issuedAt = Date.now();
+    try {
+      const prev = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+      if (prev.token === token) {
+        issuedAt = prev.issuedAt || fs.statSync(TOKEN_FILE).mtimeMs;
+      }
+    } catch { /* no habia fichero previo */ }
+    tokenIssuedAt = issuedAt;
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token, expiresAt, issuedAt }), { mode: 0o600 });
   } catch (err) {
     console.error('[token] no se pudo guardar:', err.message);
   }
@@ -300,6 +313,10 @@ function wireCloud(cloud) {
       app_state.status = { connected: false, detail: `Relogin fallido: ${res.error}` };
     }
     broadcast('status', app_state.status);
+    broadcast('login-pending', { pending: app_state.loginPending });
+    warnAdmins(
+      '🔑 El token de Bambu Cloud ha caducado. Entra en el panel de administración y verifica con el código que Bambu envía por email.',
+    );
   });
 }
 
@@ -342,6 +359,9 @@ jobCycle.on('phase', (info) => {
   }
 });
 
+// Tras «Cerrar sesión» el BAMBU_TOKEN del entorno no puede resucitar la sesión.
+let envTokenBlocked = false;
+
 async function startCloud() {
   const cloud = new BambuCloud({
     email: process.env.BAMBU_EMAIL,
@@ -350,7 +370,7 @@ async function startCloud() {
     // El token en cache manda sobre BAMBU_TOKEN: la variable de entorno es
     // solo la semilla inicial. Al reves, un BAMBU_TOKEN caducado ganaria para
     // siempre al token nuevo obtenido desde el dashboard.
-    accessToken: loadCachedToken() || process.env.BAMBU_TOKEN || null,
+    accessToken: loadCachedToken() || (envTokenBlocked ? null : process.env.BAMBU_TOKEN) || null,
     serial: process.env.PRINTER_SERIAL || null,
   });
   app_state.cloud = cloud;
@@ -384,6 +404,7 @@ async function startCloud() {
             : 'Introduce tu codigo 2FA en el dashboard.',
       };
       broadcast('status', app_state.status);
+      broadcast('login-pending', { pending: app_state.loginPending });
       return;
     }
     app_state.status = { connected: false, detail: res.error };
@@ -397,7 +418,9 @@ async function startCloud() {
 let taskTimer = null;
 
 async function finishStartup(cloud) {
+  const wasPending = app_state.loginPending;
   app_state.loginPending = null;
+  if (wasPending) broadcast('login-pending', { pending: null });
 
   const devices = await cloud.listDevices();
   if (devices.length === 0) {
@@ -429,7 +452,60 @@ async function finishStartup(cloud) {
   // un solo intervalo, no uno por llamada.
   clearInterval(taskTimer);
   taskTimer = setInterval(refreshTask, 60_000);
+  checkTokenExpiry();
 }
+
+// ---------------------------------------------------------------------------
+// Caducidad del token de Bambu: avisos al administrador
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// De mayor a menor: cuantos umbrales ha cruzado ya el token = nivel de aviso.
+const TOKEN_WARN_MS = [14 * DAY_MS, 7 * DAY_MS, 3 * DAY_MS, DAY_MS, 6 * 60 * 60 * 1000];
+
+/** Aviso operativo: solo a los admin (a todos si aun no hay roles). */
+function warnAdmins(text) {
+  notifier.fire(
+    'tokenExpiry',
+    text,
+    { level: 'warning', printerName: 'Bambustatus', audience: admins.active ? 'admin' : 'all' },
+    { force: true },
+  );
+}
+
+/** Caducidad real (JWT) > BAMBU_TOKEN_EXPIRES (fecha ISO) > emision + BAMBU_TOKEN_DAYS (90). */
+function tokenExpiry() {
+  const cloud = app_state.cloud;
+  if (!cloud?.accessToken) return null;
+  if (cloud.tokenExpiresAt) return cloud.tokenExpiresAt;
+  const manual = Date.parse(process.env.BAMBU_TOKEN_EXPIRES || '');
+  if (Number.isFinite(manual)) return manual;
+  if (!tokenIssuedAt) tokenIssuedAt = Date.now();
+  const days = Number(process.env.BAMBU_TOKEN_DAYS) || 90;
+  return tokenIssuedAt + days * DAY_MS;
+}
+
+function humanLeft(ms) {
+  const h = Math.round(ms / 3_600_000);
+  return h >= 48 ? `${Math.round(h / 24)} días` : `${Math.max(h, 1)} h`;
+}
+
+function checkTokenExpiry() {
+  const exp = tokenExpiry();
+  if (!exp) return;
+  const left = exp - Date.now();
+  if (left <= 0) return; // lo gestiona 'auth-expired'
+  const level = TOKEN_WARN_MS.filter((t) => left <= t).length;
+  if (level === 0) return;
+  const saved = store.get('tokenWarn');
+  if (saved && saved.exp === exp && saved.level >= level) return;
+  store.set('tokenWarn', { exp, level });
+  warnAdmins(
+    `🔑 El token de Bambu Cloud caduca en ${humanLeft(left)}. Renuévalo desde el panel de administración ` +
+      '(Cerrar sesión → Reconectar); hará falta el código que Bambu envía por email.',
+  );
+}
+setInterval(checkTokenExpiry, 60 * 60 * 1000).unref();
 
 /** La portada del print vive en la API REST, no en MQTT. */
 async function refreshTask() {
@@ -1148,6 +1224,7 @@ app.get('/api/settings', requireAuth, (req, res) => {
       webhook: Boolean(process.env.GENERIC_WEBHOOK),
     },
     account: process.env.BAMBU_EMAIL || null,
+    tokenExpiresAt: tokenExpiry(),
   });
 });
 
@@ -1173,12 +1250,18 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
  */
 app.post('/api/admin/announce', requireAuth, requireAdmin, (req, res) => {
   const custom = String(req.body?.text || '').trim().slice(0, 160);
-  const event = notifier.announce(custom || '🔄 Abre la app: hay una actualización en camino', {
-    printerName: 'Bambustatus',
-    detail: custom
-      ? null
-      : 'Al aplicarse, la interfaz se reiniciará. Ábrela para no quedarte con una versión vieja.',
-  });
+  // Se pide esperar: al avisar, la version nueva aun se esta desplegando y
+  // abrir la app antes de tiempo carga la antigua.
+  const WAIT = 'Accede pasados 10 min desde que recibas este aviso.';
+  const event = notifier.announce(
+    custom ? `${custom} ${WAIT}` : `🔄 Hay una actualización en camino. ${WAIT}`,
+    {
+      printerName: 'Bambustatus',
+      detail: custom
+        ? null
+        : 'Al aplicarse, la interfaz se reiniciará. Espera 10 minutos desde este aviso antes de abrir la app para no quedarte con una versión vieja.',
+    },
+  );
   // El reparto lo hace fire() por dentro y no se espera a que termine: lo
   // que el panel necesita saber no es si el push service ha contestado, sino
   // a cuantos aparatos iba dirigido y cuantos estaban callados.
@@ -1198,10 +1281,12 @@ app.post('/api/admin/announce', requireAuth, requireAdmin, (req, res) => {
  * verificacion por email, que es como Bambu protege esta cuenta.
  */
 app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
+  envTokenBlocked = true;
   app_state.cloud?.disconnect();
   if (app_state.cloud) {
     app_state.cloud.accessToken = null;
     app_state.cloud.mqttUsername = null;
+    app_state.cloud.tokenExpiresAt = null;
   }
   fs.rmSync(TOKEN_FILE, { force: true });
   clearInterval(taskTimer);
@@ -1216,12 +1301,21 @@ app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
   };
   broadcast('status', app_state.status);
   broadcast('bambu-logout', { at: Date.now() });
+  broadcast('login-pending', { pending: null });
   res.json({ ok: true });
 });
 
 /** Rehace el login de Bambu tras un cierre de sesion, sin reiniciar el proceso. */
 app.post('/api/admin/bambu-login', requireAuth, requireAdmin, async (req, res) => {
   try {
+    // Sin esto, «Reconectar» con la sesión viva dejaba dos conexiones MQTT
+    // a la vez (avisos duplicados) y la vieja seguía reaccionando a errores.
+    if (app_state.cloud) {
+      app_state.cloud.removeAllListeners();
+      app_state.cloud.on('error', () => {});
+      app_state.cloud.disconnect();
+    }
+    clearInterval(taskTimer);
     await startCloud();
     res.json({ ok: true, loginPending: app_state.loginPending });
   } catch (err) {
