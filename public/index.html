@@ -2485,6 +2485,10 @@ function connectWs() {
     }
     else if (type === 'state') { lastDataAt = Date.now(); renderState(payload); paintSync(); }
     else if (type === 'status') renderStatus(payload);
+    else if (type === 'login-pending') {
+      if (payload.pending) handleLoginPending(payload.pending);
+      else { $('code-gate').classList.add('hidden'); $('app').classList.remove('hidden'); }
+    }
     else if (type === 'printer') renderPrinter(payload);
     else if (type === 'task') renderTask(payload);
     else if (type === 'cycle') {
@@ -3830,7 +3834,8 @@ async function showAdminPanel() {
     if (r.devices) renderDevices(r.devices);
     const channels = Object.entries(r.channels || {}).filter(([, v]) => v).map(([k]) => k);
     $('account-note').textContent = r.account
-      ? `Sesión iniciada como ${r.account}.`
+      ? `Sesión iniciada como ${r.account}.` + (r.tokenExpiresAt
+        ? ` El token caduca el ${new Date(r.tokenExpiresAt).toLocaleDateString('es-ES')}.` : '')
       : 'No hay ninguna cuenta configurada.';
     // Diagnostico en tres partes: servidor, este dispositivo, otros canales.
     const lines = [];
@@ -4383,8 +4388,8 @@ async function waitForAcks(sentAt, only, timeoutMs = 12_000) {
  */
 $('btn-announce').onclick = async () => {
   const btn = $('btn-announce');
-  if (!confirm('Se avisará a todos los dispositivos de que viene una actualización y de que '
-      + 'abran la app pasados 10 minutos desde que reciban el aviso. ¿Enviar?')) return;
+  if (!confirm('Se avisará a todos los dispositivos de que abran la app porque viene una '
+      + 'actualización y de que accedan pasados 10 minutos desde el aviso. ¿Enviar?')) return;
   btn.disabled = true;
   try {
     const res = await fetch('/api/admin/announce', { method: 'POST' });
@@ -4413,10 +4418,9 @@ $('btn-bambu-login').onclick = async () => {
   const res = await fetch('/api/admin/bambu-login', { method: 'POST' });
   const j = await res.json().catch(() => ({}));
   if (!res.ok) { toast(j.error || 'No se pudo reconectar', 'err'); return; }
-  if (j.loginPending) toast('Bambu ha enviado un código de verificación', 'ok');
-  else if (j.connected) toast('Reconectado', 'ok');
-  else toast(j.detail || 'No se pudo reconectar', 'err');
+  toast(j.loginPending ? 'Bambu ha enviado un código de verificación' : 'Reconectando…', 'ok');
   $('admin').classList.add('hidden');
+  handleLoginPending(j.loginPending);
 };
 
 $('btn-dash-logout').onclick = async () => {

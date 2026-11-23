@@ -178,35 +178,21 @@ function loadCachedToken() {
   }
 }
 
-// Bambu ya no da un JWT legible: el token es opaco y no trae fecha de caducidad.
-// Lo unico que se puede hacer es contar desde que se obtuvo. Vive unos 90 dias
-// (BAMBU_TOKEN_LIFETIME_DAYS lo ajusta). Sin disco (Render gratis) la fecha se
-// pierde en cada reinicio: por eso BAMBU_TOKEN_ISSUED_AT (ISO, p. ej. 2026-11-23)
-// permite fijarla a mano junto al BAMBU_TOKEN.
-const TOKEN_LIFETIME_MS = Number(process.env.BAMBU_TOKEN_LIFETIME_DAYS || 90) * 86_400_000;
-const TOKEN_WARN_DAYS = [14, 7, 3, 1];
-
-function readTokenFile() {
-  try {
-    return JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
-/** Cuando se obtuvo el token en uso, o null si no se sabe. */
-function tokenIssuedAt(token) {
-  const f = readTokenFile();
-  if (f.token && f.token === token && Number.isFinite(f.issuedAt)) return f.issuedAt;
-  const env = Date.parse(process.env.BAMBU_TOKEN_ISSUED_AT || '');
-  if (Number.isFinite(env) && token && token === process.env.BAMBU_TOKEN) return env;
-  return null;
-}
+// El token de Bambu es opaco (sin "exp"), asi que la caducidad se estima desde
+// el momento en que se obtuvo: se guarda junto al token. Si es el mismo token
+// que ya estaba en disco se conserva la fecha original.
+let tokenIssuedAt = null;
 
 function saveToken({ token, expiresAt }) {
   try {
-    const prev = readTokenFile();
-    const issuedAt = prev.token === token && Number.isFinite(prev.issuedAt) ? prev.issuedAt : Date.now();
+    let issuedAt = Date.now();
+    try {
+      const prev = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+      if (prev.token === token) {
+        issuedAt = prev.issuedAt || fs.statSync(TOKEN_FILE).mtimeMs;
+      }
+    } catch { /* no habia fichero previo */ }
+    tokenIssuedAt = issuedAt;
     fs.writeFileSync(TOKEN_FILE, JSON.stringify({ token, expiresAt, issuedAt }), { mode: 0o600 });
   } catch (err) {
     console.error('[token] no se pudo guardar:', err.message);
@@ -224,50 +210,6 @@ function broadcast(type, payload) {
   for (const ws of wss.clients) {
     if (ws.readyState === 1) ws.send(msg);
   }
-}
-
-// ---------------------------------------------------------------------------
-// Avisos al administrador sobre el token de Bambu
-// ---------------------------------------------------------------------------
-
-const adminTokenAlerts = new Map(); // tag -> ultimo envio
-const ADMIN_ALERT_GAP_MS = 6 * 3_600_000;
-
-/** Push solo a los dispositivos de administrador, sin repetirse en 6 h. */
-function alertAdmins(tag, body) {
-  const last = adminTokenAlerts.get(tag) || 0;
-  if (Date.now() - last < ADMIN_ALERT_GAP_MS) return;
-  adminTokenAlerts.set(tag, Date.now());
-  console.warn(`[token] aviso a administradores: ${body}`);
-  if (!push.enabled) return;
-  push
-    .send(
-      { title: 'Bambustatus', body, tag: `token-${tag}`, url: '/' },
-      { audience: 'admin' },
-    )
-    .catch((err) => console.error('[token] aviso fallido:', err.message));
-}
-
-/** Revisa cuantos dias le quedan al token y avisa en 14, 7, 3 y 1 dias. */
-function checkTokenExpiry() {
-  const token = app_state.cloud?.accessToken;
-  if (!token) return;
-  const issued = tokenIssuedAt(token);
-  if (!issued) return;
-  const daysLeft = Math.ceil((issued + TOKEN_LIFETIME_MS - Date.now()) / 86_400_000);
-  const step = TOKEN_WARN_DAYS.find((d) => daysLeft <= d);
-  if (step === undefined) return;
-  alertAdmins(
-    `expiry-${step}`,
-    daysLeft <= 0
-      ? '⚠️ El token de Bambu ha caducado o está a punto de hacerlo. Renuévalo desde el panel: Cerrar sesión y Reconectar.'
-      : `⚠️ El token de Bambu caduca en ~${daysLeft} día(s). Renuévalo desde el panel: Cerrar sesión y Reconectar.`,
-  );
-}
-
-/** La app se ha quedado sin sesion de Bambu y hace falta una persona. */
-function alertTokenNeeded(detail) {
-  alertAdmins('needed', `🔑 Bambustatus ha perdido la conexión con Bambu: ${detail}`);
 }
 
 /** Resumen del estado de Web Push que consumen el snapshot y varias rutas. */
@@ -345,7 +287,6 @@ function wireCloud(cloud) {
 
   cloud.on('auth-expired', async () => {
     console.warn('[cloud] token caducado, reintentando login');
-    ignoreEnvToken = true;
     cloud.disconnect();
     fs.rmSync(TOKEN_FILE, { force: true });
     cloud.mqttUsername = null;
@@ -372,7 +313,10 @@ function wireCloud(cloud) {
       app_state.status = { connected: false, detail: `Relogin fallido: ${res.error}` };
     }
     broadcast('status', app_state.status);
-    alertTokenNeeded(app_state.status.detail);
+    broadcast('login-pending', { pending: app_state.loginPending });
+    warnAdmins(
+      '🔑 El token de Bambu Cloud ha caducado. Entra en el panel de administración y verifica con el código que Bambu envía por email.',
+    );
   });
 }
 
@@ -415,6 +359,9 @@ jobCycle.on('phase', (info) => {
   }
 });
 
+// Tras «Cerrar sesión» el BAMBU_TOKEN del entorno no puede resucitar la sesión.
+let envTokenBlocked = false;
+
 async function startCloud() {
   const cloud = new BambuCloud({
     email: process.env.BAMBU_EMAIL,
@@ -423,7 +370,7 @@ async function startCloud() {
     // El token en cache manda sobre BAMBU_TOKEN: la variable de entorno es
     // solo la semilla inicial. Al reves, un BAMBU_TOKEN caducado ganaria para
     // siempre al token nuevo obtenido desde el dashboard.
-    accessToken: loadCachedToken() || (ignoreEnvToken ? null : process.env.BAMBU_TOKEN) || null,
+    accessToken: loadCachedToken() || (envTokenBlocked ? null : process.env.BAMBU_TOKEN) || null,
     serial: process.env.PRINTER_SERIAL || null,
   });
   app_state.cloud = cloud;
@@ -439,7 +386,6 @@ async function startCloud() {
       if (!err.unauthorized) throw err;
       // El token cacheado ya no sirve: lo tiramos y hacemos login normal.
       console.warn('[cloud] token cacheado rechazado, rehaciendo login');
-      ignoreEnvToken = true;
       fs.rmSync(TOKEN_FILE, { force: true });
       cloud.accessToken = null;
       cloud.mqttUsername = null;
@@ -458,13 +404,11 @@ async function startCloud() {
             : 'Introduce tu codigo 2FA en el dashboard.',
       };
       broadcast('status', app_state.status);
-      alertTokenNeeded(app_state.status.detail);
+      broadcast('login-pending', { pending: app_state.loginPending });
       return;
     }
     app_state.status = { connected: false, detail: res.error };
     console.error('[cloud] login fallido:', res.error);
-    broadcast('status', app_state.status);
-    alertTokenNeeded(res.error);
     return;
   }
 
@@ -473,13 +417,10 @@ async function startCloud() {
 
 let taskTimer = null;
 
-// Tras cerrar sesion, o tras un rechazo del token, BAMBU_TOKEN ya no vale como
-// semilla: sigue en el entorno, caducado, y reconectar volveria a usarlo en
-// bucle sin pedir nunca el codigo de email.
-let ignoreEnvToken = false;
-
 async function finishStartup(cloud) {
+  const wasPending = app_state.loginPending;
   app_state.loginPending = null;
+  if (wasPending) broadcast('login-pending', { pending: null });
 
   const devices = await cloud.listDevices();
   if (devices.length === 0) {
@@ -511,7 +452,60 @@ async function finishStartup(cloud) {
   // un solo intervalo, no uno por llamada.
   clearInterval(taskTimer);
   taskTimer = setInterval(refreshTask, 60_000);
+  checkTokenExpiry();
 }
+
+// ---------------------------------------------------------------------------
+// Caducidad del token de Bambu: avisos al administrador
+// ---------------------------------------------------------------------------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+// De mayor a menor: cuantos umbrales ha cruzado ya el token = nivel de aviso.
+const TOKEN_WARN_MS = [14 * DAY_MS, 7 * DAY_MS, 3 * DAY_MS, DAY_MS, 6 * 60 * 60 * 1000];
+
+/** Aviso operativo: solo a los admin (a todos si aun no hay roles). */
+function warnAdmins(text) {
+  notifier.fire(
+    'tokenExpiry',
+    text,
+    { level: 'warning', printerName: 'Bambustatus', audience: admins.active ? 'admin' : 'all' },
+    { force: true },
+  );
+}
+
+/** Caducidad real (JWT) > BAMBU_TOKEN_EXPIRES (fecha ISO) > emision + BAMBU_TOKEN_DAYS (90). */
+function tokenExpiry() {
+  const cloud = app_state.cloud;
+  if (!cloud?.accessToken) return null;
+  if (cloud.tokenExpiresAt) return cloud.tokenExpiresAt;
+  const manual = Date.parse(process.env.BAMBU_TOKEN_EXPIRES || '');
+  if (Number.isFinite(manual)) return manual;
+  if (!tokenIssuedAt) tokenIssuedAt = Date.now();
+  const days = Number(process.env.BAMBU_TOKEN_DAYS) || 90;
+  return tokenIssuedAt + days * DAY_MS;
+}
+
+function humanLeft(ms) {
+  const h = Math.round(ms / 3_600_000);
+  return h >= 48 ? `${Math.round(h / 24)} días` : `${Math.max(h, 1)} h`;
+}
+
+function checkTokenExpiry() {
+  const exp = tokenExpiry();
+  if (!exp) return;
+  const left = exp - Date.now();
+  if (left <= 0) return; // lo gestiona 'auth-expired'
+  const level = TOKEN_WARN_MS.filter((t) => left <= t).length;
+  if (level === 0) return;
+  const saved = store.get('tokenWarn');
+  if (saved && saved.exp === exp && saved.level >= level) return;
+  store.set('tokenWarn', { exp, level });
+  warnAdmins(
+    `🔑 El token de Bambu Cloud caduca en ${humanLeft(left)}. Renuévalo desde el panel de administración ` +
+      '(Cerrar sesión → Reconectar); hará falta el código que Bambu envía por email.',
+  );
+}
+setInterval(checkTokenExpiry, 60 * 60 * 1000).unref();
 
 /** La portada del print vive en la API REST, no en MQTT. */
 async function refreshTask() {
@@ -1230,6 +1224,7 @@ app.get('/api/settings', requireAuth, (req, res) => {
       webhook: Boolean(process.env.GENERIC_WEBHOOK),
     },
     account: process.env.BAMBU_EMAIL || null,
+    tokenExpiresAt: tokenExpiry(),
   });
 });
 
@@ -1255,13 +1250,16 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
  */
 app.post('/api/admin/announce', requireAuth, requireAdmin, (req, res) => {
   const custom = String(req.body?.text || '').trim().slice(0, 160);
+  // Se pide esperar: al avisar, la version nueva aun se esta desplegando y
+  // abrir la app antes de tiempo carga la antigua.
+  const WAIT = 'Accede pasados 10 min desde que recibas este aviso.';
   const event = notifier.announce(
-    custom || '🔄 Hay una actualización en camino: abre la app pasados 10 minutos desde este aviso',
+    custom ? `${custom} ${WAIT}` : `🔄 Hay una actualización en camino. ${WAIT}`,
     {
       printerName: 'Bambustatus',
       detail: custom
         ? null
-        : 'Al aplicarse, la interfaz se reiniciará. Espera 10 minutos desde que recibas este aviso y entonces abre la app, para no quedarte con una versión vieja.',
+        : 'Al aplicarse, la interfaz se reiniciará. Espera 10 minutos desde este aviso antes de abrir la app para no quedarte con una versión vieja.',
     },
   );
   // El reparto lo hace fire() por dentro y no se espera a que termine: lo
@@ -1283,13 +1281,14 @@ app.post('/api/admin/announce', requireAuth, requireAdmin, (req, res) => {
  * verificacion por email, que es como Bambu protege esta cuenta.
  */
 app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
+  envTokenBlocked = true;
   app_state.cloud?.disconnect();
   if (app_state.cloud) {
     app_state.cloud.accessToken = null;
     app_state.cloud.mqttUsername = null;
+    app_state.cloud.tokenExpiresAt = null;
   }
   fs.rmSync(TOKEN_FILE, { force: true });
-  ignoreEnvToken = true;
   clearInterval(taskTimer);
 
   app_state.normalized = null;
@@ -1302,19 +1301,23 @@ app.post('/api/admin/bambu-logout', requireAuth, requireAdmin, (req, res) => {
   };
   broadcast('status', app_state.status);
   broadcast('bambu-logout', { at: Date.now() });
+  broadcast('login-pending', { pending: null });
   res.json({ ok: true });
 });
 
 /** Rehace el login de Bambu tras un cierre de sesion, sin reiniciar el proceso. */
 app.post('/api/admin/bambu-login', requireAuth, requireAdmin, async (req, res) => {
   try {
+    // Sin esto, «Reconectar» con la sesión viva dejaba dos conexiones MQTT
+    // a la vez (avisos duplicados) y la vieja seguía reaccionando a errores.
+    if (app_state.cloud) {
+      app_state.cloud.removeAllListeners();
+      app_state.cloud.on('error', () => {});
+      app_state.cloud.disconnect();
+    }
+    clearInterval(taskTimer);
     await startCloud();
-    res.json({
-      ok: true,
-      loginPending: app_state.loginPending,
-      connected: Boolean(app_state.status?.connected),
-      detail: app_state.status?.detail || '',
-    });
+    res.json({ ok: true, loginPending: app_state.loginPending });
   } catch (err) {
     res.status(502).json({ error: err.message });
   }
@@ -1444,9 +1447,6 @@ server.listen(PORT, () => {
     );
   }
   if (push.enabled) console.log(`[push] activo, ${push.count} dispositivo(s) suscrito(s)`);
-  // Aviso de caducidad del token al administrador: al arrancar y cada 6 horas.
-  setTimeout(checkTokenExpiry, 60_000).unref();
-  setInterval(checkTokenExpiry, 6 * 3_600_000).unref();
   console.log(
     `[errores] catálogo oficial v${ERROR_DB_INFO.version} (${ERROR_DB_INFO.lang}): ` +
       `${ERROR_DB_INFO.hmsCount} códigos HMS, ${ERROR_DB_INFO.printCount} de impresión` +
